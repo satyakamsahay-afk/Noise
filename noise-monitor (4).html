@@ -1,0 +1,272 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Noise Monitor — Aryabhatta Niketan</title>
+<style>
+  body{font-family:-apple-system,Segoe UI,Roboto,Arial,sans-serif;background:#0b1220;color:#e8edf5;margin:0;padding:20px;max-width:480px;margin:0 auto;}
+  h1{font-size:1.15rem;margin:0 0 4px;}
+  p.sub{color:#9aa7bd;font-size:0.85rem;margin:0 0 18px;}
+  label{display:block;font-size:0.78rem;color:#9aa7bd;margin:10px 0 4px;}
+  input{width:100%;box-sizing:border-box;padding:9px 10px;border-radius:8px;border:1px solid #2a3550;background:#141d33;color:#e8edf5;font-size:0.9rem;}
+  .cfg-row{display:flex;gap:8px;}
+  .cfg-row > div{flex:1;}
+  .meter{margin:22px 0;text-align:center;}
+  .db-value{font-size:3rem;font-weight:700;line-height:1;}
+  .db-label{color:#9aa7bd;font-size:0.8rem;margin-top:4px;}
+  .bar{height:14px;border-radius:7px;background:#141d33;overflow:hidden;margin-top:14px;}
+  .bar-fill{height:100%;width:0%;background:#3ba3ff;transition:width 0.1s linear, background 0.2s;}
+  .btn{width:100%;padding:13px;border-radius:10px;border:none;font-size:1rem;font-weight:600;cursor:pointer;margin-top:16px;}
+  .btn-start{background:#2ecc71;color:#06210f;}
+  .btn-stop{background:#e74c3c;color:#2a0805;}
+  .btn-share{background:#3ba3ff;color:#06172a;}
+  .btn-clear{background:#2a3550;color:#e8edf5;}
+  .btn-row{display:flex;gap:8px;}
+  .btn-row .btn{flex:1;}
+  .status{font-size:0.8rem;color:#9aa7bd;margin-top:10px;min-height:1.2em;}
+  .saved-count{font-size:0.85rem;margin-top:22px;color:#e8edf5;}
+  .saved-count b{color:#3ba3ff;}
+  .saved-list{margin-top:8px;font-size:0.78rem;color:#c3cbdb;background:#141d33;border-radius:8px;padding:10px;max-height:140px;overflow-y:auto;}
+  .saved-list div{padding:3px 0;border-bottom:1px solid #202a45;}
+  .saved-list div:last-child{border-bottom:none;}
+  .saved-list .muted{color:#6c7793;}
+  .log{margin-top:14px;font-size:0.78rem;color:#c3cbdb;background:#141d33;border-radius:8px;padding:10px;max-height:120px;overflow-y:auto;}
+  .log div{padding:3px 0;border-bottom:1px solid #202a45;}
+  .log div:last-child{border-bottom:none;}
+</style>
+</head>
+<body>
+<h1>🔊 Noise Monitor</h1>
+<p class="sub">Detects sound crossing the Alert Level below and saves the average/peak dB over the Record Duration — to THIS DEVICE ONLY. Nothing is sent anywhere automatically. Use Export & Share when the admin asks for the data.</p>
+<label>Your Employee Hub email (tagged on every saved reading)</label>
+<input id="email" placeholder="name@abnpatna.com">
+<div class="cfg-row">
+  <div><label>Alert Level (dB)</label><input id="dbLevel" type="number" step="0.1" min="0" max="140" value="70"></div>
+  <div><label>Record Duration (s)</label><input id="durationSec" type="number" step="1" min="1" max="120" value="5"></div>
+  <div><label>Repeat Interval (s)</label><input id="repeatSec" type="number" step="1" min="0" max="3600" value="180"></div>
+</div>
+<div class="meter">
+  <div class="db-value" id="dbValue">--</div>
+  <div class="db-label">current dB (approx.)</div>
+  <div class="bar"><div class="bar-fill" id="dbBar"></div></div>
+</div>
+<button class="btn btn-start" id="startBtn">▶ Start Monitoring</button>
+<button class="btn btn-stop" id="stopBtn" style="display:none;">■ Stop Monitoring</button>
+<div class="status" id="statusNote"></div>
+<div class="saved-count">💾 Saved on this device: <b id="savedCount">0</b></div>
+<div class="saved-list" id="savedList"></div>
+<div class="btn-row">
+  <button class="btn btn-share" id="shareBtn">📤 Export &amp; Share</button>
+  <button class="btn btn-clear" id="clearBtn">🗑️ Clear</button>
+</div>
+<div class="log" id="activityLog"></div>
+<script>
+(function() {
+  var STORAGE_KEY = "noiseCapture_savedReadings";
+  var savedReadings = [];
+  try { savedReadings = JSON.parse(localStorage.getItem(STORAGE_KEY) || "[]"); } catch (e) { savedReadings = []; }
+  var lastEventEndAt = 0;
+  var sampling = false, samples = [], samplingEndAt = 0;
+  var audioCtx = null, stream = null, analyser = null, rafId = null;
+  var textFields = ["email"];
+  var numFields = ["dbLevel", "durationSec", "repeatSec"];
+  textFields.concat(numFields).forEach(function(id) {
+    var el = document.getElementById(id);
+    var saved = localStorage.getItem("noiseCapture_" + id);
+    if (saved) el.value = saved;
+    el.addEventListener("change", function() { localStorage.setItem("noiseCapture_" + id, el.value); });
+  });
+  function cfgNum(id, fallback) {
+    var v = parseFloat(document.getElementById(id).value);
+    return isFinite(v) && v >= 0 ? v : fallback;
+  }
+  function log(msg) {
+    var box = document.getElementById("activityLog");
+    var line = document.createElement("div");
+    line.textContent = new Date().toLocaleTimeString() + " — " + msg;
+    box.insertBefore(line, box.firstChild);
+  }
+  function zoneColor(db, thresholdDb) {
+    if (db >= thresholdDb) return "#e74c3c";
+    if (db >= thresholdDb - 20) return "#f1c40f";
+    return "#3ba3ff";
+  }
+  function computeDb(bytes) {
+    var sumSq = 0;
+    for (var i = 0; i < bytes.length; i++) {
+      var dev = (bytes[i] - 128) / 128;
+      sumSq += dev * dev;
+    }
+    var rms = Math.sqrt(sumSq / bytes.length);
+    var db = rms > 0 ? (20 * Math.log10(rms) + 100) : 0;
+    if (db < 0) db = 0;
+    if (db > 140) db = 140;
+    return Math.round(db * 10) / 10;
+  }
+  function renderSavedReadings() {
+    document.getElementById("savedCount").textContent = savedReadings.length;
+    var listEl = document.getElementById("savedList");
+    if (!savedReadings.length) { listEl.innerHTML = "<div class=\"muted\">Nothing saved yet.</div>"; return; }
+    var recent = savedReadings.slice(-10).slice().reverse();
+    listEl.innerHTML = recent.map(function(r) {
+      return "<div>" + new Date(r.ts).toLocaleString() + " — avg " + r.avgDb + " dB, peak " + r.peakDb + " dB</div>";
+    }).join("");
+  }
+  function saveReadingLocally(avgDb, peakDb) {
+    var email = document.getElementById("email").value.trim();
+    savedReadings.push({ ts: new Date().toISOString(), email: email, avgDb: avgDb, peakDb: peakDb });
+    try { localStorage.setItem(STORAGE_KEY, JSON.stringify(savedReadings)); } catch (e) { /* storage full/blocked — keep it in memory for this session at least */ }
+    renderSavedReadings();
+    log("Saved locally — " + savedReadings.length + " total on this device.");
+  }
+  function csvEscape(v) {
+    v = (v === undefined || v === null) ? "" : String(v);
+    return /[,"\n]/.test(v) ? ("\"" + v.replace(/"/g, "\"\"") + "\"") : v;
+  }
+  function buildCsv() {
+    var lines = ["Timestamp,Email,AvgDB,PeakDB"];
+    savedReadings.forEach(function(r) {
+      lines.push([csvEscape(r.ts), csvEscape(r.email), csvEscape(r.avgDb), csvEscape(r.peakDb)].join(","));
+    });
+    return lines.join("\r\n") + "\r\n";
+  }
+  function exportAndShare() {
+    if (!savedReadings.length) { log("Nothing saved yet — nothing to share."); return; }
+    var csv = buildCsv();
+    var filename = "noise-readings-" + new Date().toISOString().slice(0, 10) + ".csv";
+    var shared = false;
+    try {
+      if (typeof File === "function" && navigator.canShare) {
+        var file = new File([csv], filename, { type: "text/csv" });
+        if (navigator.canShare({ files: [file] })) {
+          shared = true;
+          navigator.share({ files: [file], title: "Noise Readings", text: savedReadings.length + " noise reading(s)" })
+            .then(function() { log("Shared " + savedReadings.length + " reading(s)."); })
+            .catch(function(err) { log("Share cancelled or failed: " + (err && err.message ? err.message : err)); });
+        }
+      }
+    } catch (e) { shared = false; }
+    if (!shared) {
+      var blob = new Blob([csv], { type: "text/csv" });
+      var url = URL.createObjectURL(blob);
+      var a = document.createElement("a");
+      a.href = url; a.download = filename;
+      document.body.appendChild(a); a.click(); document.body.removeChild(a);
+      setTimeout(function() { URL.revokeObjectURL(url); }, 5000);
+      log("Downloaded " + filename + " — attach it to WhatsApp/email yourself, or send the link your file app gives you.");
+    }
+  }
+  function clearSavedReadings() {
+    if (savedReadings.length && !confirm("Clear all " + savedReadings.length + " saved reading(s) from this device? This cannot be undone.")) return;
+    savedReadings = [];
+    try { localStorage.removeItem(STORAGE_KEY); } catch (e) {}
+    renderSavedReadings();
+    log("Cleared all saved readings.");
+  }
+  function tick() {
+    if (!analyser) return;
+    var thresholdDb = cfgNum("dbLevel", 100);
+    var durationMs = cfgNum("durationSec", 5) * 1000;
+    var repeatMs = cfgNum("repeatSec", 30) * 1000;
+    var bytes = new Uint8Array(analyser.fftSize);
+    analyser.getByteTimeDomainData(bytes);
+    var db = computeDb(bytes);
+    document.getElementById("dbValue").textContent = db.toFixed(1);
+    document.getElementById("dbValue").style.color = zoneColor(db, thresholdDb);
+    var pct = Math.max(0, Math.min(100, (db / 140) * 100));
+    var bar = document.getElementById("dbBar");
+    bar.style.width = pct + "%";
+    bar.style.background = zoneColor(db, thresholdDb);
+    var now = Date.now();
+    if (sampling) {
+      samples.push(db);
+      if (now >= samplingEndAt) {
+        var sum = 0, peak = 0;
+        for (var i = 0; i < samples.length; i++) { sum += samples[i]; if (samples[i] > peak) peak = samples[i]; }
+        var avg = Math.round((sum / samples.length) * 10) / 10;
+        sampling = false;
+        lastEventEndAt = now;
+        document.getElementById("statusNote").textContent = "Monitoring… keep this tab open.";
+        log("Event captured over " + (durationMs / 1000) + "s — avg " + avg + " dB, peak " + peak + " dB.");
+        saveReadingLocally(avg, peak);
+      }
+    } else if (db >= thresholdDb && (now - lastEventEndAt) >= repeatMs) {
+      sampling = true;
+      samples = [db];
+      samplingEndAt = now + durationMs;
+      document.getElementById("statusNote").textContent = "Crossed " + thresholdDb + " dB — sampling for " + (durationMs / 1000) + "s…";
+      log("Crossed " + thresholdDb + " dB (" + db + ") — sampling starts.");
+    }
+    rafId = requestAnimationFrame(tick);
+  }
+  function permissionHelp_(errName) {
+    var ua = navigator.userAgent || "";
+    var isIOS = /iPhone|iPad|iPod/.test(ua);
+    var isAndroid = /Android/.test(ua);
+    if (errName === "NotFoundError" || errName === "DevicesNotFoundError") {
+      return "No microphone was found on this device.";
+    }
+    if (errName === "NotReadableError" || errName === "TrackStartError") {
+      return "The microphone is already in use by another app. Close other apps using it, then tap Start again.";
+    }
+    if (errName === "SecurityError") {
+      return "This page must be opened over a real https:// address for the microphone to be allowed.";
+    }
+    // NotAllowedError / PermissionDeniedError — by far the common one: either
+    // the browser's own prompt was dismissed with Deny, or it was denied once
+    // before and the browser is no longer asking at all. Either way, this
+    // page cannot re-trigger that prompt itself — only the browser's own
+    // site settings can undo a Deny, so the fix has to be spelled out.
+    if (isIOS) {
+      return "Microphone access was denied. In Safari: tap \"aA\" in the address bar → Website Settings → Microphone → Allow, then reload this page. In Settings app instead: Settings → Safari → Microphone → Allow. (Using Chrome on iPhone: Settings app → Chrome → Microphone → Allow.)";
+    }
+    if (isAndroid) {
+      return "Microphone access was denied. Tap the 🔒 or ⓘ icon next to the address bar → Permissions → Microphone → Allow, then reload this page. (Or: browser menu → Settings → Site settings → Microphone → find this site → Allow.)";
+    }
+    return "Microphone access was denied. Open your browser's site settings (usually the padlock icon next to the address bar), allow Microphone for this page, then reload.";
+  }
+  function start() {
+    document.getElementById("statusNote").textContent = "Requesting microphone access — tap Allow on the prompt.";
+    navigator.mediaDevices.getUserMedia({ audio: true }).then(function(s) {
+      stream = s;
+      audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+      var source = audioCtx.createMediaStreamSource(stream);
+      analyser = audioCtx.createAnalyser();
+      analyser.fftSize = 2048;
+      source.connect(analyser);
+      sampling = false; samples = [];
+      document.getElementById("startBtn").style.display = "none";
+      document.getElementById("stopBtn").style.display = "";
+      document.getElementById("statusNote").textContent = "Monitoring… keep this tab open.";
+      log("Monitoring started.");
+      tick();
+    }).catch(function(err) {
+      var help = permissionHelp_(err && err.name);
+      document.getElementById("statusNote").textContent = help;
+      log("Mic error (" + (err && err.name) + "): " + (err && err.message));
+    });
+  }
+  function stop() {
+    if (rafId) cancelAnimationFrame(rafId);
+    rafId = null;
+    sampling = false; samples = [];
+    if (stream) stream.getTracks().forEach(function(t) { t.stop(); });
+    if (audioCtx) audioCtx.close();
+    stream = null; audioCtx = null; analyser = null;
+    document.getElementById("startBtn").style.display = "";
+    document.getElementById("stopBtn").style.display = "none";
+    document.getElementById("statusNote").textContent = "Stopped.";
+    document.getElementById("dbValue").textContent = "--";
+    document.getElementById("dbBar").style.width = "0%";
+    log("Monitoring stopped.");
+  }
+  document.getElementById("startBtn").addEventListener("click", start);
+  document.getElementById("stopBtn").addEventListener("click", stop);
+  document.getElementById("shareBtn").addEventListener("click", exportAndShare);
+  document.getElementById("clearBtn").addEventListener("click", clearSavedReadings);
+  renderSavedReadings();
+})();
+</script>
+</body>
+</html>
